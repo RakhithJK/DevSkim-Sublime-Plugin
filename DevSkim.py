@@ -98,6 +98,8 @@ suppress_days = []
 # Conditional Functions
 conditional_func_map = {}
 
+# Are we waiting for an execution callback?
+in_periodic_callback = False
 
 class DevSkimEventListener(sublime_plugin.EventListener):
     """Handles events from Sublime Text."""
@@ -244,18 +246,19 @@ class DevSkimEventListener(sublime_plugin.EventListener):
                 contents = self.view.substr(sublime.Region(region_start, region_end))
                 logger.debug("Applying fixit to contents [{0}]".format(contents))
 
-                fixit = rule.get('fix_it')
-                if not fixit or fixid >= len(fixit):
+                fixits = rule.get('fix_its')
+                if not fixits or fixid >= len(fixits):
                     continue
 
-                fixit = fixit[fixid]
+                fixit = fixits[fixid]
                 if not fixit:
                     logger.warn("Tried to apply fixit #{%s}, but was not found in dict.", fixid)
                     continue
 
-                if fixit['type'] == 'regex-substitute':
-                    search = fixit.get('search')
-                    replace = fixit.get('replace')
+                if fixit['type'] == 'regex-replace':
+                    fixit_pattern = fixit.get('pattern').get('pattern')
+                    # TODO have to continue here
+                    replace = fixit.get('replacement')
                     flags = self.re_modifiers_to_flags(fixit.get('modifiers', []))
 
                     for k in range(1, 9):
@@ -497,12 +500,15 @@ class DevSkimEventListener(sublime_plugin.EventListener):
             scope_list = ["%s." % s for s in result.get('scope_list')]
             logger.debug("Current Scope: [%s], Applies to: %s", scope_name, scope_list)
 
-            # Don't actually include if we're in a comment, or a quoted string, etc.
-            if any([x in scope_name for x in scope_list]) or not scope_list:
-                marked_regions.append(result.get('match_region'))
-                finding_list.append(result)
+            ## Don't actually include if we're in a comment, or a quoted string, etc.
+            #if any([x in scope_name for x in scope_list]) or not scope_list:
+            #    marked_regions.append(result.get('match_region'))
+            #    finding_list.append(result)
 
-        logger.debug("Set marked regions to: %s" % marked_regions)
+            marked_regions.append(result.get('match_region'))
+            finding_list.append(result)
+
+        logger.debug("Set marked regions to: %s", marked_regions)
 
         # Add a region (squiggly underline)
         view.add_regions("devskim-marks",
@@ -530,9 +536,9 @@ class DevSkimEventListener(sublime_plugin.EventListener):
             severity = self.severity_abbreviation(severity).upper()
 
             shown_finding_list.append([rule.get("name"), "%d: %s" %
-                                       (region[0] + 1, 
+                                       (region[0] + 1,
                                        view.substr(view.line(region_start)).strip())])
-        
+
         logger.debug("shown_findings_list has been created.")
 
         if show_popup:
@@ -570,10 +576,10 @@ class DevSkimEventListener(sublime_plugin.EventListener):
         if rule.get('replacement'):
             guidance.append('<p>%s</p>' % rule['replacement'])
 
-        if rule.get('fix_it'):
+        if rule.get('fix_its'):
             guidance.append('<h3>Options:</h3>')
             guidance.append("<ul>")
-            for fixid, fix in enumerate(rule.get('fix_it')):
+            for fixid, fix in enumerate(rule.get('fix_its')):
                 guidance.append('<li>Auto-Fix: <a href="#fixit,%s,%d,%d,%d">%s</a></li>' %
                                 (rule.get('id'), fixid, target_region.begin(), target_region.end(), fix.get('name')))
             guidance.append("</ul>")
@@ -631,7 +637,7 @@ class DevSkimEventListener(sublime_plugin.EventListener):
         rule_filenames = []
         for filename in json_filenames:
             for _dir in RULE_DIRECTORY:
-                if (DEVSKIM_RULES_DIR_PREFIX + _dir) in filename:
+                if 'outbound_network' in filename and (DEVSKIM_RULES_DIR_PREFIX + _dir) in filename:
                     rule_filenames.append(filename)
 
         # Remove duplicates
@@ -853,7 +859,7 @@ class DevSkimEventListener(sublime_plugin.EventListener):
                                        pattern_dict.get('type'))
                         continue
 
-                    scope_list = pattern_dict.get('subtype', [])
+                    scope_list = pattern_dict.get('scopes', [])
 
                     flags = self.re_modifiers_to_flags(pattern_dict.get('modifiers', []))
 
@@ -904,11 +910,108 @@ class DevSkimEventListener(sublime_plugin.EventListener):
                         }
 
                         if self.meets_conditions(context, result_details):
+                            logger.debug('Condition check was successful.')
                             result_list.append(result_details)
             else:
-                logger.debug("Not running rule check [force={0}, rule_applies={1}, syntax={2}, ext={3},]".format(
+                logger.debug("Not running rule check [force={0}, rule_applies={1}, syntax={2}, ext={3}]".format(
                     force_analyze, rule_applies_to, set(rule_applies_to) & set(syntax_types), extension))
 
+        logger.debug(result_list)
+        return result_list
+
+    def execute_pattern(self, pattern_dict, text, rule, check_suppression=True, check_scopes=False, negate_finding=False, check_conditions=True, offset=0):
+        logger.debug('execute_pattern(%s, %s, %s, %s, %s, %s)', pattern_dict, text, rule, check_suppression, check_scopes, negate_finding)
+
+        if not pattern_dict:
+            return None
+
+        pattern_str = pattern_dict.get('pattern')
+        orig_pattern_str = str(pattern_str)
+        scope_list = pattern_dict.get('scopes')
+
+        if pattern_dict.get('type') == 'substring':
+            pattern_str = re.escape(pattern_str)
+        elif pattern_dict.get('type') == 'string':
+            pattern_str = r'\b%s\b' % re.escape(pattern_str)
+        elif pattern_dict.get('type') == 'regex':
+            pass
+        elif pattern_dict.get('type') == 'regex-word':
+            pattern_str = r'\b%s\b' % pattern_str
+        else:
+            logger.warning("Invalid pattern type [%s] found.",
+                            pattern_dict.get('type'))
+
+        flags = self.re_modifiers_to_flags(pattern_dict.get('modifiers', []))
+
+        logger.debug('Searching for %s in contents.', pattern_str)
+
+        result_list = []
+
+        for match in re.finditer(pattern_str, text, flags):
+            if not match:
+                logger.debug("re.finditer([%s], [%s]) => [-]",
+                                pattern_str, len(text))
+                continue        # Does this ever happen?
+
+            logger.debug("re.finditer([%s], [%s]) => [%d, %d]",
+                            pattern_str, len(text),
+                            match.start(), match.end())
+
+            start = match.start()
+            end = match.end()
+
+            # Check for per-row suppressions
+            if check_suppression:
+                logger.debug('Checking suppressions.')
+                row_number = self.view.rowcol(start)
+                line_list = [
+                    self.view.substr(self.view.line(start))
+                ]
+                if row_number[0] > 0:   # Special case, ignore
+                    prev_line = self.view.text_point(row_number[0] - 1, 0)
+                    line_list.append(self.view.substr(self.view.line(prev_line)))
+
+                if self.is_suppressed(rule, line_list):
+                    logger.debug('is_suppressed() returned True')
+                    continue    # Don't add the result to the list
+
+            result_details = {
+                'rule': rule,
+                'match_content': match.group(),
+                'match_region': sublime.Region(start + offset, end + offset),
+                'match_start': start + offset,
+                'match_end': end + offset,
+                'pattern': orig_pattern_str,
+                'scope_list': scope_list
+            }
+
+            if check_scopes:
+                logger.debug('Checking scopes.')
+                scope_names = self.view.scope_name(start).strip().split(' ')
+                if not self.is_scope_match(scope_names, scope_list):
+                    logger.debug('Did not match scope list.')
+                    if negate_finding:
+                        continue
+            else:
+                logger.debug('Scope checking disabled.')
+
+            if check_conditions:
+                logger.debug('Checking conditions')
+                # If there are conditions, run them now
+                context = {
+                    'filename': filename,
+                    'file_contents': file_contents,
+                    'rule': rule,
+                    'pattern': pattern_dict
+                }
+
+                if self.meets_conditions(context, result_details):
+                    logger.debug('Condition check was successful.')
+                    result_list.append(result_details)
+            else:
+                result_list.append(result_details)
+
+        logger.debug('Returning %s', result_list)
         return result_list
 
     def meets_conditions(self, context, result):
@@ -917,7 +1020,7 @@ class DevSkimEventListener(sublime_plugin.EventListener):
         if not pattern:
             return True     # No pattern means same thing as them all passing.
 
-        conditions = pattern.get('conditions')
+        conditions = context.get('rule').get('conditions')
         if not conditions:
             return True     # No conditions means same as them all passing.
 
@@ -930,28 +1033,40 @@ class DevSkimEventListener(sublime_plugin.EventListener):
 
         logger.debug('Found %d conditions', len(conditions))
 
-        cond_result = True
-
         for condition in conditions:
-            name = condition.get('name', '').replace('-', '_')
-            value = condition.get('value')
-            invert = condition.get('invert', False)
+            negate_finding = condition.get('negate_finding', False)
+            pattern_dict = condition.get('pattern')
+            search_scope = condition.get('search_in', 'current-line').strip()
+            pattern_str = pattern_dict.get('pattern')
+            scope_list = pattern_dict.get('scopes', [])
 
-            if name in conditional_func_map:
-                kwargs = {
-                    'view': self.view,
-                    'line': line,
-                    'value': value
-                }
-                kwargs.update(context)
-                kwargs.update(result)
-
-                r = conditional_func_map[name](**kwargs)
-                cond_result &= not r if invert else r
+            if search_scope == 'finding-only':
+                search_target = result.get('match-content')
+            elif search_scope == 'current-line':
+                search_target = line
             else:
-                logger.warning('Invalid condition name: %s', name)
+                # Expectation: finding-region(-10, 10) means 10 lines around finding line
+                matches = re.match(r'finding-region\((-?\d+)\),\((-?\d+)\)', search_scope)
+                start_line_number = self.view.rowcol(match_start) + matches.group(1)
+                end_line_number = start_line_number + matches.group(2) + 1
 
-        return cond_result
+                if matches:
+                    search_region = sublime.Region(view.text_point(start_line_number - 1, 0),
+                                                   view.text_point(end_line_number - 1, 0))
+                    search_target = self.view.lines(_start_region, _end_region)
+                    logger.debug('Found finding-region(%s, %s) => %s',
+                                  matches.group(1), matches.group(2), search_target)
+
+            if not search_target:
+                logger.debug('No search target found, ignoring.')
+                return True
+
+            result = self.execute_pattern(pattern_dict, search_target, context.get('rule'), check_suppression=False,
+                                          check_scopes=True, check_conditions=False, negate_finding=negate_finding):
+            if result:
+                return True
+
+        return True
 
     def severity_abbreviation(self, severity):
         """Convert a severity name into an abbreviation."""
@@ -1092,6 +1207,35 @@ class DevSkimEventListener(sublime_plugin.EventListener):
 
         return False
 
+    def is_scope_match(self, needles, haystack):
+        """Check to see if the scope of the region (needles) is included
+           in what we're looking for (haystack)."""
+        logger.debug('is_scope_match(%s, %s)', needles, haystack)
+
+        if not needles or not haystack:
+            return True
+
+        needles = set(map(lambda x: x.strip().lower(), needles))
+        haystack = set(map(lambda x: x.strip().lower(), haystack))
+
+        if 'all' in haystack:
+            return True
+
+        if needles.intersection(haystack):
+            return True
+
+        for needle in needles:
+            if 'source.' in needle and 'code' in haystack:
+                return True
+
+            if 'comment.' in needle and 'comment' in haystack:
+                return True
+
+            if 'html' in needle and 'html' in haystack:
+                return True
+
+        return False
+
 class ReplaceTextCommand(sublime_plugin.TextCommand):
     """Simple function to route text changes to view."""
 
@@ -1137,26 +1281,36 @@ class DevSkimReloadRulesCommand(sublime_plugin.TextCommand):
         stylesheet_content = ""
 
 def periodic_analysis_callback():
+    """Kicks off analysis periodically."""
+    global in_periodic_callback
+
+    if not in_periodic_callback:
+        return
+
     try:
         view = sublime.active_window().active_view()
         view.run_command("dev_skim_analyze", args={'show_popup': False})
-        frequency = sublime.load_settings('DevSkim.sublime-settings').get('show_highlights_on_time', 0)
         # Re-evaluate this so changes are picked up if the user changes their config.
+        frequency = sublime.load_settings('DevSkim.sublime-settings').get('show_highlights_on_time', 0)
         if frequency > 0:
             sublime.set_timeout_async(periodic_analysis_callback, frequency)
 
     except Exception as msg:
-        print("Error: {0}".format(msg))
+        logger.error("Error: {0}", msg)
 
 def plugin_loaded():
     """Handle the plugin_loaded event from ST3."""
+    global in_periodic_callback
     logger.info('DevSkim plugin_loaded(), Sublime Text v%s' % sublime.version())
 
     # Schedule analysis based on configuration
     frequency = sublime.load_settings('DevSkim.sublime-settings').get('show_highlights_on_time', 0)
     if frequency > 0:
-        sublime.set_timeout_async(periodic_analysis_callback, frequency)
+        if not in_periodic_callback:
+            sublime.set_timeout_async(periodic_analysis_callback, frequency)
+            in_periodic_callback = True
 
 def plugin_unloaded():
     """Handle the plugin_unloaded event from ST3."""
     logger.info("DevSkim plugin_unloaded()")
+    in_periodic_callback = False
