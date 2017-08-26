@@ -25,8 +25,6 @@ except Exception as _:
     import sys
     sys.exit(1)
 
-from . import DevSkimConditionals
-
 # Non-Configurable Settings
 MIN_ST_VERSION = 3114
 MARK_FLAGS = sublime.DRAW_NO_FILL | sublime.HIDE_ON_MINIMAP
@@ -170,12 +168,6 @@ class DevSkimEventListener(sublime_plugin.EventListener):
 
             logger.handlers = []
             logger.addHandler(console)
-
-        # Initialize the conditionals
-        for func in dir(DevSkimConditionals):
-            if func.startswith('condition__'):
-                func_short = func.replace('condition__', '')
-                conditional_func_map[func_short] = getattr(DevSkimConditionals, func)
 
     def clear_regions(self, view):
         """Clear all regions."""
@@ -1158,7 +1150,7 @@ class DevSkimEventListener(sublime_plugin.EventListener):
                         return True
 
                     suppress_until = suppress_until.replace('until', '').strip()
-                    
+
                     try:
                         suppress_until = datetime.datetime.strptime(suppress_until, '%Y-%m-%d')
                         if datetime.date.today() < suppress_until.date():
