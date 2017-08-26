@@ -82,6 +82,7 @@ applies_to_ext_alias = {
     "c": "c++",
     "cpp": "c++",
     "csharp": "c#",
+    "dotnet": "c#",
     "ios": "objective-c++",
     "objective-c": "objective-c++"
 }
@@ -264,7 +265,7 @@ class DevSkimEventListener(sublime_plugin.EventListener):
                     for k in range(1, 9):
                         replace = replace.replace("${0}".format(k), "\\{0}".format(k))
 
-                    result = re.sub(search, replace, contents, flags=flags)
+                    result = re.sub(fixit_pattern, replace, contents, flags=flags)
                     logger.debug("Result of search/replace was [%s]", result)
 
                     self.view.run_command('replace_text', {
@@ -273,7 +274,7 @@ class DevSkimEventListener(sublime_plugin.EventListener):
                         'result': result
                     })
                 else:
-                    logger.warn("Invalid fixit type found, {0}".format(fixit['type']))
+                    logger.warn("Invalid fixit type found, %s", fixit['type'])
 
                 self.view.hide_popup()
                 self.clear_regions(self.view)
@@ -495,7 +496,7 @@ class DevSkimEventListener(sublime_plugin.EventListener):
 
         for result in result_list:
             # Narrow down to just the matching part of the line
-            scope_name = view.scope_name(result.get('match_region').begin())
+            scope_name = view.scope_name(result.get('match_region').begin()).strip()
 
             scope_list = ["%s." % s for s in result.get('scope_list')]
             logger.debug("Current Scope: [%s], Applies to: %s", scope_name, scope_list)
@@ -637,7 +638,8 @@ class DevSkimEventListener(sublime_plugin.EventListener):
         rule_filenames = []
         for filename in json_filenames:
             for _dir in RULE_DIRECTORY:
-                if 'outbound_network' in filename and (DEVSKIM_RULES_DIR_PREFIX + _dir) in filename:
+                #if 'outbound_network' in filename and (DEVSKIM_RULES_DIR_PREFIX + _dir) in filename:
+                if (DEVSKIM_RULES_DIR_PREFIX + _dir) in filename:
                     rule_filenames.append(filename)
 
         # Remove duplicates
@@ -790,11 +792,12 @@ class DevSkimEventListener(sublime_plugin.EventListener):
 
     def execute(self, file_contents, filename=None, extension=None, syntax=None,
                 severities=None, force_analyze=False, offset=0):
-        """Execute all of the rules against a given string of text."""
+        """Execute all of the rules against a given string of text (file_contents).
+           Returns a list of findings."""
         global rules, applies_to_ext_mapping
 
-        logger.debug("execute([len=%d], [name=%s], [ext=%s], [syntax=%s], [force=%s], [offset=%d])" %
-                     (len(file_contents), filename, extension, syntax, force_analyze, offset))
+        logger.debug("execute([len=%d], [name=%s], [ext=%s], [syntax=%s], [force=%s], [offset=%d])",
+                     len(file_contents), filename, extension, syntax, force_analyze, offset)
 
         filename_basename = os.path.basename(filename).strip()
 
@@ -809,118 +812,126 @@ class DevSkimEventListener(sublime_plugin.EventListener):
                     extension in v.get('extensions', [])):
                 k = k.replace("\"", "")     # Some names are quoted
                 syntax_types.append(k)
-        result_list = []
         syntax_types = list(set(syntax_types))
-
         logger.debug("Loaded syntax types: {0}".format(syntax_types))
 
-        for rule in rules:
-            logger.debug('Rule: {0}'.format(rule.get('id', None)))
+        result_list = []    # We'll put the final results here
 
-            # Don't even scan for rules that we don't care about
+        for rule in rules:
+            logger.debug('Processing rule %s - %s', rule.get('id'), rule.get('name'))
+
+            # Filter out rules that don't meet our severity configuration
             if not force_analyze and rule.get('severity', 'critical') not in severities:
-                logger.debug("Ignoring rule [%s] due to severity." % rule.get('id', ''))
+                logger.debug("Ignoring rule [%s] due to severity.", rule.get('id'))
                 continue
 
             # No syntax means "match any syntax"
-            rule_applies_to = rule.get('applies_to', [])
-            if (force_analyze or
-                    not rule_applies_to or
-                    filename_basename in rule_applies_to or
-                    set(rule_applies_to) & set(syntax_types) or
-                    '.%s' % extension in rule_applies_to):
+            rule_applies_to = set(rule.get('applies_to', []))
+            if (not force_analyze and                              # force_analyze: True
+                    rule_applies_to and                            # rule.applies_to: None
+                    filename_basename not in rule_applies_to and   # rule.applies_to: App.config
+                    not(rule_applies_to & set(syntax_types)) and   # rule.applies_to: scope.c.source [non-portable]
+                    '.%s' % extension not in rule_applies_to):     # rule.applies_to: .config
 
-                for pattern_dict in rule['patterns']:
-                    # Secondary applicability
-                    pattern_applies_to = set(pattern_dict.get('applies_to', []))
-                    if (pattern_applies_to and
-                            not force_analyze and
-                            not pattern_applies_to & set(syntax_types) and
-                            not '.%s' % extension in pattern_applies_to):
-                        logger.debug("Ignoring rule [%s], applicability check." % rule.get('id', ''))
-                        continue
+                logger.debug("Not running rule check [force=%s, rule_applies=%s, syntax=%s, ext=%s]", 
+                    force_analyze, rule_applies_to, rule_applies_to & set(syntax_types), extension)
 
-                    pattern_str = pattern_dict.get('pattern')
+                continue    # Run next rule
 
-                    start = end = -1
+            for pattern_dict in rule['patterns']:
+                # Secondary applicability
+                pattern_applies_to = set(pattern_dict.get('applies_to', []))
+                if (not force_analyze and
+                        pattern_applies_to and
+                        not pattern_applies_to & set(syntax_types) and
+                        not '.%s' % extension in pattern_applies_to):
+                    
+                    logger.debug("Ignoring rule [%s], pattern-applicability check.", rule.get('id', ''))
+                    
+                    continue    # Next pattern
 
-                    orig_pattern_str = pattern_str
+                pattern_str = pattern_dict.get('pattern')
+                orig_pattern_str = pattern_str
+                
+                start = end = -1
 
-                    if pattern_dict.get('type') == 'substring':
-                        pattern_str = re.escape(pattern_str)
-                    elif pattern_dict.get('type') == 'string':
-                        pattern_str = r'\b%s\b' % re.escape(pattern_str)
-                    elif pattern_dict.get('type') == 'regex':
-                        pass
-                    elif pattern_dict.get('type') == 'regex-word':
-                        pattern_str = r'\b%s\b' % pattern_str
-                    else:
-                        logger.warning("Invalid pattern type [%s] found." %
-                                       pattern_dict.get('type'))
-                        continue
+                if pattern_dict.get('type') == 'substring':
+                    pattern_str = re.escape(pattern_str)
+                elif pattern_dict.get('type') == 'string':
+                    pattern_str = r'\b%s\b' % re.escape(pattern_str)
+                elif pattern_dict.get('type') == 'regex':
+                    pass
+                elif pattern_dict.get('type') == 'regex-word':
+                    pattern_str = r'\b%s\b' % pattern_str
+                else:
+                    logger.warning("Invalid pattern type [%s] found." %
+                                    pattern_dict.get('type'))
+                    continue
 
-                    scope_list = pattern_dict.get('scopes', [])
+                scope_list = pattern_dict.get('scopes', [])
 
-                    flags = self.re_modifiers_to_flags(pattern_dict.get('modifiers', []))
+                flags = self.re_modifiers_to_flags(pattern_dict.get('modifiers', []))
 
-                    logger.debug('Searching for {0} in contents.'.format(pattern_str))
+                logger.debug('Searching for [%s] in contents.', pattern_str)
 
-                    for match in re.finditer(pattern_str, file_contents, flags):
+                for match in re.finditer(pattern_str, file_contents, flags):
 
-                        if not match:
-                            logger.debug("re.finditer([%s], [%s]) => [-]" %
-                                         (pattern_str, len(file_contents)))
-                            continue        # Does this ever happen?
+                    if not match:
+                        logger.debug("re.finditer([%s], [%s]) => [-]",
+                                      pattern_str, len(file_contents))
+                        continue      # Next match (TODO: Does this ever happen?)
 
-                        logger.debug("re.finditer([%s], [%s]) => [%d, %d]" %
-                                     (pattern_str, len(file_contents),
-                                      match.start(), match.end()))
+                    logger.debug("re.finditer([%s], [%s]) => [%s, %d, %d]",
+                                  pattern_str, len(file_contents), match.group(0),
+                                  match.start(), match.end())
 
-                        start = match.start()
-                        end = match.end()
+                    # Check for per-row suppressions
+                    line_list = [
+                        self.view.substr(self.view.line(match.start()))
+                    ]
 
-                        # Check for per-row suppressions
-                        row_number = self.view.rowcol(start)
-                        line_list = [
-                            self.view.substr(self.view.line(start))
-                        ]
-                        if row_number[0] > 0:   # Special case, ignore
-                            prev_line = self.view.text_point(row_number[0] - 1, 0)
-                            line_list.append(self.view.substr(self.view.line(prev_line)))
+                    # TODO: Why is this necessary again?
+                    row_number = self.view.rowcol(match.start())
+                    if row_number[0] > 0:   # Special case, ignore
+                        prev_line = self.view.text_point(row_number[0] - 1, 0)
+                        line_list.append(self.view.substr(self.view.line(prev_line)))
 
-                        if self.is_suppressed(rule, line_list):
-                            continue    # Don't add the result to the list
+                    # External check to see if rule is suppressed in line_line
+                    if self.is_suppressed(rule, line_list):
+                        continue    # Don't add, continue with next match.
 
-                        # If there are conditions, run them now
-                        context = {
-                            'filename': filename,
-                            'file_contents': file_contents,
-                            'rule': rule,
-                            'pattern': pattern_dict
-                        }
+                    # If there are conditions, run them now
+                    context = {
+                        'filename': filename,
+                        'file_contents': file_contents,
+                        'rule': rule,
+                        'pattern': pattern_dict
+                    }
 
-                        result_details = {
-                            'rule': rule,
-                            'match_content': match.group(),
-                            'match_region': sublime.Region(start + offset, end + offset),
-                            'match_start': start + offset,
-                            'match_end': end + offset,
-                            'pattern': orig_pattern_str,
-                            'scope_list': scope_list
-                        }
+                    result_details = {
+                        'rule': rule,
+                        'match_content': match.group(),
+                        'match_region': sublime.Region(match.start() + offset, match.end() + offset),
+                        'match_start': match.start() + offset,
+                        'match_end': match.end() + offset,
+                        'pattern': orig_pattern_str,
+                        'scope_list': scope_list
+                    }
 
-                        if self.meets_conditions(context, result_details):
-                            logger.debug('Condition check was successful.')
-                            result_list.append(result_details)
-            else:
-                logger.debug("Not running rule check [force={0}, rule_applies={1}, syntax={2}, ext={3}]".format(
-                    force_analyze, rule_applies_to, set(rule_applies_to) & set(syntax_types), extension))
+                    if not self.meets_conditions(context, result_details):
+                        logger.debug('Condition check failed, ignoring finding.')
+                        continue    # Next match
+                    
+                    # All tests passed, so add the result to the list.
+                    result_list.append(result_details)
 
-        logger.debug(result_list)
+        logger.debug('Completed result list, length=%d', len(result_list))
         return result_list
 
-    def execute_pattern(self, pattern_dict, text, rule, check_suppression=True, check_scopes=False, negate_finding=False, check_conditions=True, offset=0):
-        logger.debug('execute_pattern(%s, %s, %s, %s, %s, %s)', pattern_dict, text, rule, check_suppression, check_scopes, negate_finding)
+    def execute_pattern(self, pattern_dict, text, rule, check_suppression=True, check_scopes=False, 
+                        negate_finding=False, check_conditions=True, offset=0):
+        logger.debug('execute_pattern(%s, %s, %s, %s, %s, %s)', pattern_dict, text, 
+                     rule, check_suppression, check_scopes, negate_finding)
 
         if not pattern_dict:
             return None
@@ -946,6 +957,8 @@ class DevSkimEventListener(sublime_plugin.EventListener):
         logger.debug('Searching for %s in contents.', pattern_str)
 
         result_list = []
+        
+        logger.debug('pattern_str=%s, text=%s', pattern_str, text)
 
         for match in re.finditer(pattern_str, text, flags):
             if not match:
@@ -1016,9 +1029,12 @@ class DevSkimEventListener(sublime_plugin.EventListener):
 
     def meets_conditions(self, context, result):
         """Checks to see if a finding meets specified conditions from the rule."""
+        logger.debug('meets_conditions()')
+
         pattern = context.get('pattern')
         if not pattern:
-            return True     # No pattern means same thing as them all passing.
+            logger.debug('Pattern was empty in context: ', context)
+            return False     # Empty patterns never match (special case)
 
         conditions = context.get('rule').get('conditions')
         if not conditions:
@@ -1036,7 +1052,7 @@ class DevSkimEventListener(sublime_plugin.EventListener):
         for condition in conditions:
             negate_finding = condition.get('negate_finding', False)
             pattern_dict = condition.get('pattern')
-            search_scope = condition.get('search_in', 'current-line').strip()
+            search_scope = pattern_dict.get('search_in', 'current-line').strip()
             pattern_str = pattern_dict.get('pattern')
             scope_list = pattern_dict.get('scopes', [])
 
@@ -1046,25 +1062,33 @@ class DevSkimEventListener(sublime_plugin.EventListener):
                 search_target = line
             else:
                 # Expectation: finding-region(-10, 10) means 10 lines around finding line
-                matches = re.match(r'finding-region\((-?\d+)\),\((-?\d+)\)', search_scope)
-                start_line_number = self.view.rowcol(match_start) + matches.group(1)
-                end_line_number = start_line_number + matches.group(2) + 1
+                matches = re.match(r'finding-region\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)', search_scope)
+                if not matches:
+                    logger.debug('Failed to find finding-region(..) in %s', search_scope)
+                    continue
 
-                if matches:
-                    search_region = sublime.Region(view.text_point(start_line_number - 1, 0),
-                                                   view.text_point(end_line_number - 1, 0))
-                    search_target = self.view.lines(_start_region, _end_region)
-                    logger.debug('Found finding-region(%s, %s) => %s',
-                                  matches.group(1), matches.group(2), search_target)
+                start_line_number = self.view.rowcol(match_start)[0] + int(matches.group(1)) + 1
+                end_line_number = self.view.rowcol(match_start)[0] + int(matches.group(2)) + 1
+
+                logger.debug('Looking for region in range [%d, %d]', start_line_number, end_line_number)
+                search_region = sublime.Region(self.view.text_point(start_line_number, 0),
+                                               self.view.text_point(end_line_number, 0))
+                #search_target = self.view.lines(search_region)
+                search_target = self.view.substr(search_region)
+                logger.debug('Found finding-region(%s, %s) => %s (%s)',
+                                matches.group(1), matches.group(2), search_target, search_region)
 
             if not search_target:
                 logger.debug('No search target found, ignoring.')
                 return True
 
             result = self.execute_pattern(pattern_dict, search_target, context.get('rule'), check_suppression=False,
-                                          check_scopes=True, check_conditions=False, negate_finding=negate_finding):
-            if result:
-                return True
+                                          check_scopes=True, check_conditions=False, negate_finding=negate_finding)
+            
+            logger.debug('Result of execute_pattern() was %s', result)
+            return len(result)
+            #if not result:
+            #    return not negate_finding
 
         return True
 
@@ -1108,12 +1132,16 @@ class DevSkimEventListener(sublime_plugin.EventListener):
                 continue
 
             if user_settings.get('allow_suppress_specific_rules'):
-                for match in re.finditer(r'ignore ([^\s]+)\s*(?!\s+until (\d{4}-\d{2}-\d{2}))', line):
+                logger.debug('finditer(%s, %s)', r'ignore ([^\s]+)\s*(?!\s+until (\d{4}-\d{2}-\d{2}))', line)
+                for match in re.finditer(r'ignore ([^\s]+)\s*(until (\d{4}-\d{2}-\d{2}))?', line):
                     if match.group(1).lower() == rule.get('id').lower():
                         suppress_until = match.group(2)
                         if suppress_until is None:
                             # Permanent suppression of this rule
                             return True
+                        
+                        suppress_until = suppress_until.replace('until', '').strip()
+                        
                         try:
                             suppress_until = datetime.datetime.strptime(suppress_until, '%Y-%m-%d')
                             if datetime.date.today() < suppress_until.date():
@@ -1123,11 +1151,14 @@ class DevSkimEventListener(sublime_plugin.EventListener):
                             logger.debug("Error parsing suppression date 1: %s", msg)
 
             if user_settings.get('allow_suppress_all_rules'):
-                for match in re.finditer(r'ignore all\s*(?!\s+until (\d{4}-\d{2}-\d{2}))', line):
+                for match in re.finditer(r'ignore all\s*(until (\d{4}-\d{2}-\d{2}))?', line):
                     suppress_until = match.group(1)
                     if suppress_until is None:
                         # Permanent suppression of all rules
                         return True
+
+                    suppress_until = suppress_until.replace('until', '').strip()
+                    
                     try:
                         suppress_until = datetime.datetime.strptime(suppress_until, '%Y-%m-%d')
                         if datetime.date.today() < suppress_until.date():
@@ -1137,7 +1168,7 @@ class DevSkimEventListener(sublime_plugin.EventListener):
                         logger.debug("Error parsing suppression date 2: %s", msg)
 
             if rule.get('severity') == 'manual-review':
-                if re.search(r'reviewed ([^\s]+)\s*(?!\s+on \d{4}-\d{2}-\d{2})', line):
+                if re.search(r'reviewed ([^\s]+)\s*(on \d{4}-\d{2}-\d{2})?', line):
                     logger.debug('Ignoring rule [%s], manual review complete.', rule.get('id'))
                     return True
 
@@ -1225,7 +1256,7 @@ class DevSkimEventListener(sublime_plugin.EventListener):
             return True
 
         for needle in needles:
-            if 'source.' in needle and 'code' in haystack:
+            if any([n in needle for n in ['source.', 'text.']]) and 'code' in haystack:
                 return True
 
             if 'comment.' in needle and 'comment' in haystack:
