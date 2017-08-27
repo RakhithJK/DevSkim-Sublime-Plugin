@@ -61,5 +61,9 @@
 
   /* Globally suppress these rules (list of rule IDs, like "DS123456") */
   "suppress_rules": [
-  ]
+  ],
+
+  /* When clicking 'more info', this is the base URL you navigate to */
+  "more_info_base_url": "https://github.com/Microsoft/DevSkim/blob/master/guidance/{0}"
+
 }

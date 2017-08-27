@@ -222,6 +222,11 @@ class DevSkimEventListener(sublime_plugin.EventListener):
             webbrowser.open_new(command)
             return
 
+        if re.match(r'^DS', command, re.IGNORECASE):
+            info_url = user_settings.get('more_info_base_url').format(command)
+            webbrowser.open_new(info_url)
+            return
+        
         # Special commands, intercept and perform the fix
         if command.startswith('#fixit'):
             rule_id, fixid, region_start, region_end = command.split(',')[1:]
@@ -915,7 +920,8 @@ class DevSkimEventListener(sublime_plugin.EventListener):
                         continue    # Next match
                     
                     # All tests passed, so add the result to the list.
-                    result_list.append(result_details)
+                    if result_details not in result_list:
+                        result_list.append(result_details)
 
         logger.debug('Completed result list, length=%d', len(result_list))
         return result_list
